@@ -3,7 +3,6 @@ import os
 import time
 import hashlib
 import threading
-import socket
 import configparser
 from pathlib import Path
 from datetime import datetime
@@ -12,7 +11,7 @@ from PIL import Image
 from image_compositor import cached_composite_path, make_composite_and_show
 
 # -------------------- CONFIG --------------------
-UDP_BIND = ("127.0.0.1", 49731)  # legacy; file handoff mode does not use UDP
+ES_EVENT_PIPE_NAME = r"\\.\pipe\EmulationStation.Events"
 
 BACKGLASS_PIPE_NAME = r"\\.\pipe\retrobat_backglass"
 DMD_PIPE_NAME = r"\\.\pipe\retrobat_dmd"
@@ -25,11 +24,11 @@ BASE_DIR = Path(__file__).resolve().parent
 LOG_FILE = BASE_DIR / "fanart_debug.log"
 FALLBACK_IMAGE = BASE_DIR / "fallback.png"
 VIEWER_CONFIG_FILE = BASE_DIR / "fanart_server.ini"
-SELECTION_FILE = BASE_DIR / "current_selection.json"
-QUIT_FILE = BASE_DIR / "quit.signal"
 
 DMD_CACHE_VERSION = "dmd_center_v2"
 
+class ViewerShutdown(Exception):
+    pass
 
 def _load_viewer_setting(name: str, default: str, allowed: tuple[str, ...]) -> str:
     value = default
@@ -94,7 +93,6 @@ DMD_LOGO_SCALE = _load_float_setting("DmdLogoScale", 1.0, 0.1, 1.0)
 # Performance/debug knobs
 DEBUG_TIMINGS = True          # write detailed event/timing logs to fanart_debug.log
 SLOW_MS = 75.0                # flag individual operations slower than this
-POLL_MS = _load_int_setting("SelectionFilePollMs", 10, 1, 250)
 # ------------------------------------------------
 
 
@@ -104,31 +102,6 @@ def _now_ms() -> float:
 
 def _elapsed_ms(start_ms: float) -> float:
     return _now_ms() - start_ms
-
-
-def _parse_client_ts(ts_value) -> datetime | None:
-    """Parse client datetime.now().isoformat(timespec="milliseconds").
-
-    Client and server are expected to be on the same Windows machine, so this
-    compares local wall-clock timestamps. If the sender ever runs on another
-    machine, clock skew will make this number misleading.
-    """
-    if not ts_value:
-        return None
-    try:
-        return datetime.fromisoformat(str(ts_value))
-    except Exception:
-        return None
-
-
-def _client_to_wall_ms(client_ts_value, wall_dt: datetime) -> float | None:
-    client_dt = _parse_client_ts(client_ts_value)
-    if client_dt is None:
-        return None
-    try:
-        return (wall_dt - client_dt).total_seconds() * 1000.0
-    except Exception:
-        return None
 
 
 def _fmt_ms(value) -> str:
@@ -239,7 +212,7 @@ def show_media_or_blank(path: Path | None, pipe_name: str, event_id: str = "", b
     if blank_missing:
         blank_mpv(pipe_name, event_id=event_id)
     else:
-        debug(f"{event_id} no media for pipe={pipe_name}; keeping current display until debounce")
+        debug(f"{event_id} no media for pipe={pipe_name}; keeping current display")
     return False
 
 
@@ -303,65 +276,6 @@ def show_dmd_media_or_blank(path: Path | None, event_id: str = "", blank_missing
             show_in_mpv(str(centered), pipe_name=DMD_PIPE_NAME, event_id=event_id)
             return True
     return show_media_or_blank(path, DMD_PIPE_NAME, event_id=event_id, blank_missing=blank_missing)
-
-
-def looks_like_path(s: str) -> bool:
-    if not s:
-        return False
-    s = s.strip().strip('"')
-    if ":\\" in s or ":/" in s or s.startswith("\\\\") or s.startswith(("/", "\\")):
-        return True
-    # file-ish
-    lower = s.lower()
-    return lower.endswith((".zip", ".7z", ".rar", ".iso", ".chd", ".cue", ".bin", ".nes", ".sfc", ".smc", ".gb", ".gba", ".nds"))
-
-def infer_system_from_rom_path(p: Path) -> str | None:
-    """
-    Try to extract system name from ...\\RetroBat\\roms\\<system>\\...
-    """
-    parts = [x.lower() for x in p.parts]
-    try:
-        i = parts.index("roms")
-        if i + 1 < len(p.parts):
-            return p.parts[i + 1]
-    except ValueError:
-        pass
-    return None
-
-def normalize_message(msg: dict) -> dict:
-    """
-    Fix up messages where fields are swapped/missing.
-    Returns dict with 'system' and 'rom' normalized.
-    """
-    system = (msg.get("system") or "").strip().strip('"')
-    rom = (msg.get("rom") or "").strip().strip('"')
-
-    # Case: system accidentally contains full rom path
-    if looks_like_path(system) and not looks_like_path(rom):
-        # If 'system' is a path and 'rom' is a short name, swap meaning
-        rom_path = system
-        system_name = infer_system_from_rom_path(normalize_rom_path(rom_path)) or ""
-        return {**msg, "system": system_name, "rom": rom_path}
-
-    # Case: rom contains full path but system missing/garbage
-    if looks_like_path(rom):
-        rom_path = rom
-        system_name = system if system and not looks_like_path(system) else (infer_system_from_rom_path(normalize_rom_path(rom_path)) or "")
-        return {**msg, "system": system_name, "rom": rom_path}
-
-    # Case: both look like paths (rare) — pick the one that exists
-    if looks_like_path(system) and looks_like_path(rom):
-        sp = normalize_rom_path(system)
-        rp = normalize_rom_path(rom)
-        if rp.exists() and not sp.exists():
-            rom_path = rom
-        else:
-            rom_path = system
-        system_name = infer_system_from_rom_path(normalize_rom_path(rom_path)) or ""
-        return {**msg, "system": system_name, "rom": str(rom_path)}
-
-    # Otherwise assume normal format
-    return msg
 
 
 def normalize_rom_path(p: str) -> Path:
@@ -570,24 +484,13 @@ def handle_message(msg: dict):
     global _job_id, _pending_msg, _pending_job_id
 
     handle_start_ms = _now_ms()
-    raw_msg = msg
-    msg = normalize_message(msg)
-
-    recv_perf_ms = msg.get("__recv_perf_ms")
-    recv_to_handle_ms = None
-    if isinstance(recv_perf_ms, (int, float)):
-        recv_to_handle_ms = handle_start_ms - float(recv_perf_ms)
 
     with _lock:
         _job_id += 1
         job_id = _job_id
         event_id = f"[job {job_id}]"
-
-    debug(
-        f"{event_id} received raw={raw_msg} normalized={msg} "
-        f"client_to_recv={_fmt_ms(msg.get('__client_to_recv_ms'))} "
-        f"recv_to_handle={_fmt_ms(recv_to_handle_ms)}"
-    )
+    
+    debug(f"{event_id} received msg={msg}")
     _ensure_worker_started()
 
     with _pending_cond:
@@ -619,18 +522,6 @@ def _latest_only_worker():
             debug(f"{event_id} worker drop before display; newer job already queued")
             continue
 
-        client_to_display_ms = None
-        recv_to_display_ms = None
-        now_wall = datetime.now()
-        client_to_display_ms = _client_to_wall_ms(msg.get("ts"), now_wall)
-        recv_perf_ms = msg.get("__recv_perf_ms")
-        if isinstance(recv_perf_ms, (int, float)):
-            recv_to_display_ms = _now_ms() - float(recv_perf_ms)
-        debug(
-            f"{event_id} worker display start "
-            f"client_to_display={_fmt_ms(client_to_display_ms)} "
-            f"recv_to_display={_fmt_ms(recv_to_display_ms)}"
-        )
         _process_message_for_display(msg, job_id)
 
 
@@ -640,10 +531,10 @@ def _process_message_for_display(msg: dict, job_id: int):
 
     try:
         system = (msg.get("system") or "").strip().strip('"')
-        rom = (msg.get("rom") or "").strip().strip('"')
-        debug(f"{event_id} normalized system={system!r} rom={rom!r}")
+        path = (msg.get("path") or "").strip().strip('"')
+        debug(f"{event_id} normalized system={system!r} path={path!r}")
 
-        if system and not rom:
+        if system and not path:
             log(f"{event_id} system-only message received, show fallback system={system!r}")
             if not is_job_stale(job_id):
                 show_in_mpv(str(FALLBACK_IMAGE), pipe_name=BACKGLASS_PIPE_NAME, event_id=event_id)
@@ -652,11 +543,11 @@ def _process_message_for_display(msg: dict, job_id: int):
             debug(f"{event_id} worker display done system-only elapsed={_elapsed_ms(start_ms):.1f}ms")
             return
 
-        if not system or not rom:
-            debug(f"{event_id} worker skipped missing system/rom system={system!r} rom={rom!r}")
+        if not system or not path:
+            debug(f"{event_id} worker skipped missing system/path system={system!r} path={path!r}")
             return
 
-        rom_path = normalize_rom_path(rom)
+        rom_path = normalize_rom_path(path)
         fanart, marquee, backglass, logo, dmd_video = find_media_files(system, rom_path, event_id=event_id)
 
         if is_job_stale(job_id):
@@ -672,61 +563,53 @@ def _process_message_for_display(msg: dict, job_id: int):
     except Exception as e:
         log(f"{event_id} worker display error: {type(e).__name__}: {e}; elapsed={_elapsed_ms(start_ms):.1f}ms")
 
-def _read_selection_file() -> dict | None:
-    """Read the latest selection JSON written by the ES event script.
 
-    The writer should write to a temporary file and then replace/rename it over
-    current_selection.json, so the viewer normally sees complete JSON. A small
-    retry still protects against antivirus/indexing or a non-atomic writer.
-    """
-    for attempt in range(3):
+def _handle_es_event(event: dict):
+    """Translate an EmulationStation pipe event into the viewer's display message."""
+    
+    event_name = event.get("event")
+
+    if event_name == "quit":
+        _shutdown_viewer("EmulationStation quit event")
+        raise ViewerShutdown()
+
+    if event_name != "game-selected":
+        debug(f"[pipe] ignored event={event!r}")
+        return
+    
+    handle_message(event)
+
+
+def _event_pipe_listener():
+    """Continuously connect to ES and consume newline-delimited JSON events."""
+    while True:
         try:
-            text = SELECTION_FILE.read_text(encoding="utf-8-sig")
-            if not text.strip():
-                return None
-            msg = json.loads(text)
-            if isinstance(msg, dict):
-                return msg
-            log(f"[file] ignored non-object JSON in {SELECTION_FILE}: {type(msg).__name__}")
-            return None
+            debug(f"[pipe] connecting to {ES_EVENT_PIPE_NAME}")
+            with open(ES_EVENT_PIPE_NAME, "rb", buffering=0) as pipe:
+                log(f"[pipe] connected to {ES_EVENT_PIPE_NAME}")
+                while True:
+                    raw = pipe.readline()
+                    if not raw:
+                        raise BrokenPipeError("EmulationStation event pipe closed")
+                    try:
+                        event = json.loads(raw.decode("utf-8-sig"))
+                    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+                        log(f"[pipe] ignored malformed event: {type(e).__name__}: {e}")
+                        continue
+                    if not isinstance(event, dict):
+                        debug(f"[pipe] ignored non-object event type={type(event).__name__}")
+                        continue
+                    _handle_es_event(event)
+        except ViewerShutdown:
+            log("[pipe] shutdown requested")
+            return
         except FileNotFoundError:
-            return None
-        except json.JSONDecodeError as e:
-            if attempt < 2:
-                time.sleep(0.005)
-                continue
-            log(f"[file] bad JSON in {SELECTION_FILE}: {e}")
-            return None
+            debug(f"[pipe] waiting for EmulationStation pipe {ES_EVENT_PIPE_NAME}")
         except OSError as e:
-            if attempt < 2:
-                time.sleep(0.005)
-                continue
-            log(f"[file] read failed {SELECTION_FILE}: {type(e).__name__}: {e}")
-            return None
+            debug(f"[pipe] disconnected: {type(e).__name__}: {e}")
         except Exception as e:
-            log(f"[file] read error {SELECTION_FILE}: {type(e).__name__}: {e}")
-            return None
-    return None
-
-
-def _selection_file_signature() -> tuple[int, int] | None:
-    try:
-        st = SELECTION_FILE.stat()
-        return (st.st_size, getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
-    except FileNotFoundError:
-        return None
-    except OSError:
-        return None
-
-
-def _quit_file_signature() -> tuple[int, int] | None:
-    try:
-        st = QUIT_FILE.stat()
-        return (st.st_size, getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
-    except FileNotFoundError:
-        return None
-    except OSError:
-        return None
+            log(f"[pipe] listener error: {type(e).__name__}: {e}")
+        time.sleep(0.25)
 
 
 def _shutdown_viewer(reason: str):
@@ -739,78 +622,15 @@ def _shutdown_viewer(reason: str):
 
 
 def serve():
-    log("fanart_server starting (file handoff listener)...")
+    log("fanart_server starting (EmulationStation named-pipe listener)...")
     log(
         f"config BackglassScreenMode={BACKGLASS_SCREEN_MODE} "
         f"DmdScreenMode={DMD_SCREEN_MODE} SimpleFastMode=True Compositing=True "
-        f"InputMode=file SelectionFile={SELECTION_FILE} QuitFile={QUIT_FILE} PollMs={POLL_MS} "
-        f"ClientTsLatency=True DebugTimings={DEBUG_TIMINGS} SlowMs={SLOW_MS}"
+        f"InputMode=named-pipe EventPipe={ES_EVENT_PIPE_NAME} "
+        f"DebugTimings={DEBUG_TIMINGS} SlowMs={SLOW_MS}"
     )
-    log(f"Watching selection file: {SELECTION_FILE}")
-    log(f"Watching quit file: {QUIT_FILE}")
-
-    last_sig = None
-    last_quit_sig = _quit_file_signature()
-    last_payload_key = None
-    missing_logged = False
-
-    while True:
-        quit_sig = _quit_file_signature()
-        if quit_sig is not None and quit_sig != last_quit_sig:
-            _shutdown_viewer(f"quit signal file changed sig={quit_sig} path={QUIT_FILE}")
-            return
-
-        sig = _selection_file_signature()
-        if sig is None:
-            if not missing_logged:
-                debug(f"[file] waiting for selection file {SELECTION_FILE}")
-                missing_logged = True
-            time.sleep(POLL_MS / 1000.0)
-            continue
-
-        missing_logged = False
-        if sig == last_sig:
-            time.sleep(POLL_MS / 1000.0)
-            continue
-
-        read_start_ms = _now_ms()
-        recv_perf_ms = read_start_ms
-        recv_wall = datetime.now()
-        msg = _read_selection_file()
-        last_sig = sig
-        if not msg:
-            time.sleep(POLL_MS / 1000.0)
-            continue
-
-        payload_key = json.dumps(msg, sort_keys=True, ensure_ascii=False)
-        if payload_key == last_payload_key:
-            debug(f"[file] unchanged payload ignored sig={sig}")
-            time.sleep(POLL_MS / 1000.0)
-            continue
-        last_payload_key = payload_key
-
-        try:
-            client_to_recv_ms = _client_to_wall_ms(msg.get("ts"), recv_wall)
-            msg["__recv_perf_ms"] = recv_perf_ms
-            msg["__recv_wall"] = recv_wall.isoformat(timespec="milliseconds")
-            msg["__client_to_recv_ms"] = client_to_recv_ms
-            debug(
-                f"[file] changed sig={sig} path={SELECTION_FILE} "
-                f"client_ts={msg.get('ts')!r} recv_wall={msg.get('__recv_wall')} "
-                f"client_to_recv={_fmt_ms(client_to_recv_ms)} "
-                f"read_elapsed={_elapsed_ms(read_start_ms):.1f}ms msg={msg}"
-            )
-
-            cmd = (msg.get("cmd") or "").lower().strip()
-            if cmd == "quit":
-                _shutdown_viewer("received quit command from selection file")
-                return
-
-            handle_message(msg)
-        except Exception as e:
-            log(f"[file] bad message: {type(e).__name__}: {e}")
-
-        time.sleep(POLL_MS / 1000.0)
+    log(f"Listening for EmulationStation events: {ES_EVENT_PIPE_NAME}")
+    _event_pipe_listener()
 
 
 if __name__ == "__main__":
