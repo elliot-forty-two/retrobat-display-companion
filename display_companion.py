@@ -484,11 +484,17 @@ def _find_system_asset(system: str, names: tuple[str, ...]) -> Path | None:
     if not system:
         return None
 
-    system_dir = SYSTEM_MEDIA_DIR / system
-
     for name in names:
         for ext in IMAGE_EXTS:
-            nested = system_dir / f"{name}{ext}"
+            nested = SYSTEM_MEDIA_DIR / system / f"{name}{ext}"
+            if nested.exists():
+                return nested
+            
+            nested = SYSTEM_MEDIA_DIR / name / f"{system}{ext}"
+            if nested.exists():
+                return nested
+            
+            nested = SYSTEM_MEDIA_DIR / name / f"auto-{system}{ext}"
             if nested.exists():
                 return nested
 
