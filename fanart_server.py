@@ -4,6 +4,7 @@ import time
 import hashlib
 import threading
 import configparser
+from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime
 from PIL import Image
@@ -24,6 +25,7 @@ BASE_DIR = Path(__file__).resolve().parent
 LOG_FILE = BASE_DIR / "fanart_debug.log"
 FALLBACK_IMAGE = BASE_DIR / "fallback.png"
 VIEWER_CONFIG_FILE = BASE_DIR / "fanart_server.ini"
+SYSTEM_MEDIA_DIR = BASE_DIR / "systems"
 
 DMD_CACHE_VERSION = "dmd_center_v2"
 
@@ -73,6 +75,22 @@ def _load_float_setting(name: str, default: float, min_value: float, max_value: 
             value = default
     return max(min_value, min(max_value, value))
 
+def _load_csv_setting(name: str, default: str) -> set[str]:
+    value = default
+    config = configparser.ConfigParser()
+    if VIEWER_CONFIG_FILE.exists():
+        try:
+            config.read(VIEWER_CONFIG_FILE, encoding="utf-8")
+            section = config["BackglassViewer"] if "BackglassViewer" in config else {}
+            value = str(section.get(name, default))
+        except Exception:
+            value = default
+    return {
+        item.strip().lower()
+        for item in value.split(",")
+        if item.strip()
+    }
+
 
 BACKGLASS_SCREEN_MODE = _load_viewer_setting(
     "BackglassScreenMode",
@@ -89,6 +107,10 @@ DMD_SCREEN_MODE = _load_viewer_setting(
 DMD_TARGET_W = _load_int_setting("DmdWidth", 1920, 320, 8192)
 DMD_TARGET_H = _load_int_setting("DmdHeight", 480, 120, 4096)
 DMD_LOGO_SCALE = _load_float_setting("DmdLogoScale", 1.0, 0.1, 1.0)
+BLANK_ON_GAME_START_SYSTEMS = _load_csv_setting(
+    "BlankOnGameStartSystems",
+    "vpinball,futurepinball",
+)
 
 # Performance/debug knobs
 DEBUG_TIMINGS = True          # write detailed event/timing logs to fanart_debug.log
@@ -323,6 +345,53 @@ def find_media_any_across_dirs(media_dirs: list[Path], rom_stem: str, suffixes: 
     return None
 
 
+def _find_system_asset(system: str, names: tuple[str, ...]) -> Path | None:
+    """Find BackglassViewer-owned artwork for a system.
+
+    Preferred layout:
+        systems/<system>/backglass.png
+        systems/<system>/fanart.png
+        systems/<system>/marquee.png
+        systems/<system>/logo.png
+
+    A flat layout such as systems/<system>-marquee.png is also accepted.
+    """
+    system = (system or "").strip().strip('"')
+    if not system:
+        return None
+
+    system_dir = SYSTEM_MEDIA_DIR / system
+
+    for name in names:
+        for ext in IMAGE_EXTS:
+            nested = system_dir / f"{name}{ext}"
+            if nested.exists():
+                return nested
+
+            flat = SYSTEM_MEDIA_DIR / f"{system}-{name}{ext}"
+            if flat.exists():
+                return flat
+
+    return None
+
+def find_system_media(system: str, event_id: str = ""):
+    start_ms = _now_ms()
+
+    fanart = _find_system_asset(system, ("fanart", "background"))
+    marquee = _find_system_asset(system, ("marquee", "logo"))
+    backglass = _find_system_asset(system, ("backglass",))
+    logo = _find_system_asset(system, ("logo", "marquee"))
+
+    debug(
+        f"{event_id} system_media_lookup elapsed={_elapsed_ms(start_ms):.1f}ms "
+        f"system={system!r} fanart={_short_path(fanart)} "
+        f"marquee={_short_path(marquee)} backglass={_short_path(backglass)} "
+        f"logo={_short_path(logo)}"
+    )
+
+    return fanart, marquee, backglass, logo, None
+
+
 def find_media_files(system: str, rom_path: Path, event_id: str = ""):
     start_ms = _now_ms()
     rom_name = rom_path.stem
@@ -451,6 +520,15 @@ def show_selected_media(fanart: Path | None, marquee: Path | None, backglass: Pa
     return handled
 
 
+@dataclass
+class ViewerState:
+    mode: str = "browsing"
+    system: str = ""
+    browse_event: dict | None = None
+    suspended: bool = False
+
+_viewer_state = ViewerState()
+
 # -------------------- Simple latest-only display handling --------------------
 _lock = threading.Lock()
 _job_id = 0
@@ -463,6 +541,38 @@ _pending_msg = None
 _pending_job_id = 0
 _worker_started = False
 
+def _cancel_pending_display(reason: str = ""):
+    """Invalidate any in-progress/pending render before an immediate state change."""
+    global _job_id, _pending_msg, _pending_job_id
+
+    with _lock:
+        _job_id += 1
+        cancel_job_id = _job_id
+
+    with _pending_cond:
+        _pending_msg = None
+        _pending_job_id = 0
+        _pending_cond.notify_all()
+
+    debug(f"[state] cancelled pending display job={cancel_job_id} reason={reason!r}")
+
+def _blank_displays(reason: str):
+    _cancel_pending_display(reason)
+    debug(f"[state] blank displays reason={reason!r}")
+    blank_mpv(BACKGLASS_PIPE_NAME, event_id="[state]")
+    blank_mpv(DMD_PIPE_NAME, event_id="[state]")
+
+def _restore_browse_state(reason: str):
+    event = _viewer_state.browse_event
+    if not event:
+        debug(f"[state] no browse state to restore reason={reason!r}")
+        return
+
+    debug(
+        f"[state] restore browse state reason={reason!r} "
+        f"event={event.get('event')!r} system={event.get('system')!r}"
+    )
+    handle_message(dict(event))
 
 def is_job_stale(job_id: int) -> bool:
     with _lock:
@@ -530,17 +640,40 @@ def _process_message_for_display(msg: dict, job_id: int):
     start_ms = _now_ms()
 
     try:
+        event_name = (msg.get("event") or "").strip()
         system = (msg.get("system") or "").strip().strip('"')
         path = (msg.get("path") or "").strip().strip('"')
-        debug(f"{event_id} normalized system={system!r} path={path!r}")
+        debug(
+            f"{event_id} normalized event={event_name!r} "
+            f"system={system!r} path={path!r}"
+        )
 
-        if system and not path:
-            log(f"{event_id} system-only message received, show fallback system={system!r}")
-            if not is_job_stale(job_id):
+        if event_name == "system-selected":
+            if not system:
+                debug(f"{event_id} worker skipped system-selected without system")
+                return
+
+            fanart, marquee, backglass, logo, dmd_video = find_system_media(
+                system,
+                event_id=event_id,
+            )
+
+            if is_job_stale(job_id):
+                debug(f"{event_id} worker abort after system media lookup; superseded")
+                return
+
+            handled = show_selected_media(
+                fanart, marquee, backglass, logo, dmd_video,
+                event_id=event_id,
+                should_continue=lambda: not is_job_stale(job_id),
+            )
+
+            if not handled and not is_job_stale(job_id):
                 show_in_mpv(str(FALLBACK_IMAGE), pipe_name=BACKGLASS_PIPE_NAME, event_id=event_id)
-            if not is_job_stale(job_id):
                 show_in_mpv(str(FALLBACK_IMAGE), pipe_name=DMD_PIPE_NAME, event_id=event_id)
-            debug(f"{event_id} worker display done system-only elapsed={_elapsed_ms(start_ms):.1f}ms")
+
+            debug(f"{event_id} worker display done system handled={handled} elapsed={_elapsed_ms(start_ms):.1f}ms")
+
             return
 
         if not system or not path:
@@ -565,19 +698,73 @@ def _process_message_for_display(msg: dict, job_id: int):
 
 
 def _handle_es_event(event: dict):
-    """Translate an EmulationStation pipe event into the viewer's display message."""
-    
-    event_name = event.get("event")
+    """Apply EmulationStation frontend events to BackglassViewer state."""
+    event_name = (event.get("event") or "").strip()
 
     if event_name == "quit":
         _shutdown_viewer("EmulationStation quit event")
         raise ViewerShutdown()
 
-    if event_name != "game-selected":
-        debug(f"[pipe] ignored event={event!r}")
+    if event_name == "system-selected":
+        if _viewer_state.suspended:
+            debug(f"[pipe] ignored system-selected while suspended event={event!r}")
+            return
+
+        _viewer_state.mode = "browsing"
+        _viewer_state.system = (event.get("system") or "").strip().strip('"')
+        _viewer_state.browse_event = dict(event)
+        handle_message(event)
+        return
+
+    if event_name == "game-selected":
+        if _viewer_state.suspended:
+            debug(f"[pipe] ignored game-selected while suspended event={event!r}")
+            return
+
+        _viewer_state.mode = "browsing"
+        _viewer_state.system = (
+            (event.get("system") or "").strip().strip('"')
+            or _viewer_state.system
+        )
+        _viewer_state.browse_event = dict(event)
+        handle_message(event)
+        return
+
+    if event_name == "game-start":
+        _viewer_state.mode = "running"
+
+        # game-start's legacy ES arguments don't necessarily include the
+        # selected game's system, so the last browse selection is authoritative
+        # when the translated event doesn't provide one.
+        system = (
+            (event.get("system") or "").strip().strip('"')
+            or _viewer_state.system
+        )
+
+        debug(f"[state] game-start system={system!r} event={event!r}")
+
+        if system.lower() in BLANK_ON_GAME_START_SYSTEMS:
+            _blank_displays(f"game-start system={system}")
+        return
+
+    if event_name == "game-end":
+        _viewer_state.mode = "browsing"
+        if not _viewer_state.suspended:
+            _restore_browse_state("game-end")
+        return
+
+    if event_name in ("screensaver-start", "sleep"):
+        _viewer_state.suspended = True
+        _blank_displays(event_name)
+        return
+
+    if event_name in ("screensaver-stop", "wake"):
+        _viewer_state.suspended = False
+        _viewer_state.mode = "browsing"
+        _restore_browse_state(event_name)
         return
     
-    handle_message(event)
+    debug(f"[pipe] ignored event={event!r}")
 
 
 def _event_pipe_listener():
@@ -627,6 +814,8 @@ def serve():
         f"config BackglassScreenMode={BACKGLASS_SCREEN_MODE} "
         f"DmdScreenMode={DMD_SCREEN_MODE} SimpleFastMode=True Compositing=True "
         f"InputMode=named-pipe EventPipe={ES_EVENT_PIPE_NAME} "
+        f"SystemMediaDir={SYSTEM_MEDIA_DIR} "
+        f"BlankOnGameStartSystems={sorted(BLANK_ON_GAME_START_SYSTEMS)} "
         f"DebugTimings={DEBUG_TIMINGS} SlowMs={SLOW_MS}"
     )
     log(f"Listening for EmulationStation events: {ES_EVENT_PIPE_NAME}")
