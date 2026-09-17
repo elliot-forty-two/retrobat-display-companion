@@ -36,16 +36,13 @@ DMD_CACHE_VERSION = "dmd_center_v2"
 MPV_EXE = BASE_DIR / "mpv" / "mpv.exe"
 
 MPV_COMMON_ARGS = [
+    "--no-config",
     "--no-taskbar-progress",
-    "--input-gamepad=no",
     "--no-osc",
-    "--loop-file=inf",
-    "--alpha=yes",
     "--no-audio",
     "--no-input-cursor",
     "--no-input-default-bindings",
-    "--idle",
-    "--player-operation-mode=pseudo-gui",
+    "--idle=yes",
     "--keep-open=yes",
     "--image-display-duration=inf",
     "--force-window=yes",
