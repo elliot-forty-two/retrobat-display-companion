@@ -1,10 +1,10 @@
 @echo off
 setlocal
 
+cd /D "%~dp0"
+
 tasklist /FI "WINDOWTITLE eq RetroBat Backglass" | find /I "mpv.exe" >nul
 if not errorlevel 1 exit /b
-
-cd /d C:\RetroBat\plugins\BackglassViewer
 
 set BACKGLASS_PIPE=\\.\pipe\retrobat_backglass
 start "" "mpv\mpv.exe" ^
