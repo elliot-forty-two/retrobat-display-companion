@@ -26,9 +26,9 @@ IMAGE_EXTS = [".png", ".jpg", ".jpeg", ".webp"]
 VIDEO_EXTS = [".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v"]
 
 BASE_DIR = Path(__file__).resolve().parent
-LOG_FILE = BASE_DIR / "fanart_debug.log"
+LOG_FILE = BASE_DIR / "display_companion.log"
 FALLBACK_IMAGE = BASE_DIR / "fallback.png"
-VIEWER_CONFIG_FILE = BASE_DIR / "fanart_server.ini"
+VIEWER_CONFIG_FILE = BASE_DIR / "display_companion.ini"
 SYSTEM_MEDIA_DIR = BASE_DIR / "systems"
 
 DMD_CACHE_VERSION = "dmd_center_v2"
@@ -75,7 +75,7 @@ def _load_viewer_setting(name: str, default: str, allowed: tuple[str, ...]) -> s
     if VIEWER_CONFIG_FILE.exists():
         try:
             config.read(VIEWER_CONFIG_FILE, encoding="utf-8")
-            section = config["BackglassViewer"] if "BackglassViewer" in config else {}
+            section = config["DisplayCompanion"] if "DisplayCompanion" in config else {}
             value = str(section.get(name, default)).strip().lower()
         except Exception:
             value = default
@@ -91,7 +91,7 @@ def _load_int_setting(name: str, default: int, min_value: int, max_value: int) -
     if VIEWER_CONFIG_FILE.exists():
         try:
             config.read(VIEWER_CONFIG_FILE, encoding="utf-8")
-            section = config["BackglassViewer"] if "BackglassViewer" in config else {}
+            section = config["DisplayCompanion"] if "DisplayCompanion" in config else {}
             raw = section.get(name, default)
             value = int(str(raw).strip())
         except Exception:
@@ -105,7 +105,7 @@ def _load_float_setting(name: str, default: float, min_value: float, max_value: 
     if VIEWER_CONFIG_FILE.exists():
         try:
             config.read(VIEWER_CONFIG_FILE, encoding="utf-8")
-            section = config["BackglassViewer"] if "BackglassViewer" in config else {}
+            section = config["DisplayCompanion"] if "DisplayCompanion" in config else {}
             raw = section.get(name, default)
             value = float(str(raw).strip())
         except Exception:
@@ -118,7 +118,7 @@ def _load_csv_setting(name: str, default: str) -> set[str]:
     if VIEWER_CONFIG_FILE.exists():
         try:
             config.read(VIEWER_CONFIG_FILE, encoding="utf-8")
-            section = config["BackglassViewer"] if "BackglassViewer" in config else {}
+            section = config["DisplayCompanion"] if "DisplayCompanion" in config else {}
             value = str(section.get(name, default))
         except Exception:
             value = default
@@ -150,7 +150,7 @@ BLANK_ON_GAME_START_SYSTEMS = _load_csv_setting(
 )
 
 # Performance/debug knobs
-DEBUG_TIMINGS = False          # write detailed event/timing logs to fanart_debug.log
+DEBUG_TIMINGS = False          # write detailed event/timing logs to display_companion.log
 SLOW_MS = 75.0                # flag individual operations slower than this
 # ------------------------------------------------
 
@@ -473,7 +473,7 @@ def find_media_any_across_dirs(media_dirs: list[Path], rom_stem: str, suffixes: 
 
 
 def _find_system_asset(system: str, names: tuple[str, ...]) -> Path | None:
-    """Find BackglassViewer-owned artwork for a system.
+    """Find artwork for a system.
 
     Preferred layout:
         systems/<system>/backglass.png
@@ -825,7 +825,7 @@ def _process_message_for_display(msg: dict, job_id: int):
 
 
 def _handle_es_event(event: dict):
-    """Apply EmulationStation frontend events to BackglassViewer state."""
+    """Apply EmulationStation frontend events to RetroBat Display Companion state."""
     event_name = (event.get("event") or "").strip()
 
     if event_name == "quit":
@@ -936,7 +936,7 @@ def _shutdown_viewer(reason: str):
 
 
 def serve():
-    log("fanart_server starting (EmulationStation named-pipe listener)...")
+    log("RetroBat Display Companion starting (EmulationStation named-pipe listener)...")
     
     start_mpv_instances()
     
