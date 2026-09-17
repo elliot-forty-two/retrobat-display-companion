@@ -1,5 +1,7 @@
 import json
 import os
+import ctypes
+import subprocess
 import time
 import hashlib
 import threading
@@ -10,6 +12,8 @@ from datetime import datetime
 from PIL import Image
 
 from image_compositor import cached_composite_path, make_composite_and_show
+
+user32 = ctypes.windll.user32
 
 # -------------------- CONFIG --------------------
 ES_EVENT_PIPE_NAME = r"\\.\pipe\EmulationStation.Events"
@@ -28,6 +32,39 @@ VIEWER_CONFIG_FILE = BASE_DIR / "fanart_server.ini"
 SYSTEM_MEDIA_DIR = BASE_DIR / "systems"
 
 DMD_CACHE_VERSION = "dmd_center_v2"
+
+MPV_EXE = BASE_DIR / "mpv" / "mpv.exe"
+
+MPV_COMMON_ARGS = [
+    "--no-taskbar-progress",
+    "--input-gamepad=no",
+    "--no-osc",
+    "--loop-file=inf",
+    "--alpha=yes",
+    "--no-audio",
+    "--no-input-cursor",
+    "--no-input-default-bindings",
+    "--idle",
+    "--player-operation-mode=pseudo-gui",
+    "--keep-open=yes",
+    "--image-display-duration=inf",
+    "--force-window=yes",
+]
+
+MPV_INSTANCES = [
+    {
+        "name": "backglass",
+        "pipe": BACKGLASS_PIPE_NAME,
+        "screen": 1,
+        "title": "Retrobat Backglass",
+    },
+    {
+        "name": "dmd",
+        "pipe": DMD_PIPE_NAME,
+        "screen": 2,
+        "title": "Retrobat DMD",
+    },
+]
 
 class ViewerShutdown(Exception):
     pass
@@ -113,7 +150,7 @@ BLANK_ON_GAME_START_SYSTEMS = _load_csv_setting(
 )
 
 # Performance/debug knobs
-DEBUG_TIMINGS = True          # write detailed event/timing logs to fanart_debug.log
+DEBUG_TIMINGS = False          # write detailed event/timing logs to fanart_debug.log
 SLOW_MS = 75.0                # flag individual operations slower than this
 # ------------------------------------------------
 
@@ -151,6 +188,96 @@ def log(msg: str):
 def debug(msg: str):
     if DEBUG_TIMINGS:
         log(msg)
+
+
+def focus_emulationstation():
+    hwnd = user32.FindWindowW(None, "EmulationStation")
+
+    if not hwnd:
+        log("Unable to find EmulationStation window for focus restore")
+        return False
+
+    user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+    user32.SetForegroundWindow(hwnd)
+
+    log("Returned focus to EmulationStation")
+    return True
+
+
+def start_mpv(pipe_name: str, screen: int, title: str):
+    args = [
+        str(MPV_EXE),
+        *MPV_COMMON_ARGS,
+        "--fs",
+        f"--fs-screen={screen}",
+        f"--input-ipc-server={pipe_name}",
+        f"--title={title}",
+    ]
+
+    log(f"Starting MPV: title={title}, screen={screen}, pipe={pipe_name}")
+
+    creation_flags = (
+        subprocess.CREATE_NEW_PROCESS_GROUP
+        | subprocess.DETACHED_PROCESS
+    )
+
+    return subprocess.Popen(
+        args,
+        cwd=BASE_DIR,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=creation_flags,
+    )
+
+
+def mpv_pipe_available(pipe_name: str) -> bool:
+    try:
+        with open(pipe_name, "r+b", buffering=0):
+            return True
+    except OSError:
+        return False
+
+
+def ensure_mpv_running(pipe_name: str, screen: int, title: str):
+    if mpv_pipe_available(pipe_name):
+        log(f"MPV already running: {title}")
+        return
+
+    start_mpv(pipe_name, screen, title)
+
+    # Give MPV a short opportunity to create its IPC pipe.
+    deadline = time.monotonic() + 5.0
+
+    while time.monotonic() < deadline:
+        if mpv_pipe_available(pipe_name):
+            # The IPC pipe can appear slightly before the window/VO is
+            # completely ready to display media.
+            time.sleep(0.25)
+            
+            log(f"MPV ready: {title}")
+            return
+
+        time.sleep(0.05)
+
+    raise RuntimeError(
+        f"MPV failed to create IPC pipe {pipe_name}"
+    )
+
+
+def start_mpv_instances():
+    for config in MPV_INSTANCES:
+        ensure_mpv_running(
+            config["pipe"],
+            config["screen"],
+            config["title"],
+        )
+        
+    # Give Windows a moment to finish activating the second MPV window,
+    # otherwise it can steal focus again just after we switch back.
+    time.sleep(0.15)
+
+    focus_emulationstation()
 
 
 def send_mpv(cmd_obj: dict, pipe_name: str = BACKGLASS_PIPE_NAME, timeout_s: float = 1.5, event_id: str = "") -> bool:
@@ -810,6 +937,9 @@ def _shutdown_viewer(reason: str):
 
 def serve():
     log("fanart_server starting (EmulationStation named-pipe listener)...")
+    
+    start_mpv_instances()
+    
     log(
         f"config BackglassScreenMode={BACKGLASS_SCREEN_MODE} "
         f"DmdScreenMode={DMD_SCREEN_MODE} SimpleFastMode=True Compositing=True "
@@ -818,7 +948,9 @@ def serve():
         f"BlankOnGameStartSystems={sorted(BLANK_ON_GAME_START_SYSTEMS)} "
         f"DebugTimings={DEBUG_TIMINGS} SlowMs={SLOW_MS}"
     )
+    
     log(f"Listening for EmulationStation events: {ES_EVENT_PIPE_NAME}")
+    
     _event_pipe_listener()
 
 
