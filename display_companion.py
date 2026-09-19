@@ -13,6 +13,8 @@ from PIL import Image
 
 from image_compositor import cached_composite_path, make_composite_and_show
 
+from capture_manager import CaptureManager, CaptureDisplay
+
 user32 = ctypes.windll.user32
 
 # -------------------- CONFIG --------------------
@@ -125,6 +127,119 @@ def _load_csv_setting(name: str, default: str) -> set[str]:
         if item.strip()
     }
 
+def _load_bool_setting(name: str, default: bool) -> bool:
+    config = configparser.ConfigParser()
+
+    if VIEWER_CONFIG_FILE.exists():
+        try:
+            config.read(
+                VIEWER_CONFIG_FILE,
+                encoding="utf-8",
+            )
+
+            section = (
+                config["DisplayCompanion"]
+                if "DisplayCompanion" in config
+                else {}
+            )
+
+            raw = str(
+                section.get(name, str(default))
+            ).strip().lower()
+
+            return raw in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+
+        except Exception:
+            pass
+
+    return default
+
+
+def _load_string_setting(
+    name: str,
+    default: str,
+) -> str:
+    config = configparser.ConfigParser()
+
+    if VIEWER_CONFIG_FILE.exists():
+        try:
+            config.read(
+                VIEWER_CONFIG_FILE,
+                encoding="utf-8",
+            )
+
+            section = (
+                config["DisplayCompanion"]
+                if "DisplayCompanion" in config
+                else {}
+            )
+
+            return str(
+                section.get(name, default)
+            ).strip()
+
+        except Exception:
+            pass
+
+    return default
+
+
+def _load_capture_display(
+    name: str,
+    coords_default: str,
+    video_default: bool,
+    fps_default: int,
+    quality_default: int,
+) -> CaptureDisplay:
+    value = _load_string_setting(
+        f"Capture{name}",
+        coords_default,
+    )
+
+    parts = [
+        int(part.strip())
+        for part in value.split(",")
+    ]
+
+    if len(parts) != 4:
+        raise ValueError(
+            f"Capture{name} must be x,y,width,height"
+        )
+
+    return CaptureDisplay(
+        name=name.lower(),
+
+        x=parts[0],
+        y=parts[1],
+        width=parts[2],
+        height=parts[3],
+
+        video_enabled=_load_bool_setting(
+            f"Capture{name}Video",
+            video_default,
+        ),
+
+        video_framerate=_load_int_setting(
+            f"Capture{name}Framerate",
+            fps_default,
+            1,
+            120,
+        ),
+
+        video_quality=_load_int_setting(
+            f"Capture{name}Quality",
+            quality_default,
+            1,
+            51,
+        ),
+
+    )
+
 
 BACKGLASS_SCREEN_MODE = _load_viewer_setting(
     "BackglassScreenMode",
@@ -185,6 +300,127 @@ def log(msg: str):
 def debug(msg: str):
     if DEBUG_TIMINGS:
         log(msg)
+
+
+CAPTURE_MANAGER = CaptureManager(
+    enabled=_load_bool_setting(
+        "CaptureEnabled",
+        False,
+    ),
+
+    systems=_load_csv_setting(
+        "CaptureSystems",
+        "vpinball",
+    ),
+
+    output_dir=Path(
+        _load_string_setting(
+            "CaptureOutputDir",
+            r"C:\RetroBat\VPinballCapture\captures",
+        )
+    ),
+
+    ffmpeg=_load_string_setting(
+        "CaptureFfmpeg",
+        "",
+    ),
+
+    duration_seconds=_load_int_setting(
+        "CaptureDurationSeconds",
+        60,
+        1,
+        3600,
+    ),
+
+    window_timeout_seconds=_load_float_setting(
+        "CaptureWindowTimeoutSeconds",
+        60.0,
+        1.0,
+        300.0,
+    ),
+
+    window_stable_seconds=_load_float_setting(
+        "CaptureWindowStableSeconds",
+        2.0,
+        0.1,
+        30.0,
+    ),
+
+    settle_seconds=_load_float_setting(
+        "CaptureSettleSeconds",
+        3.0,
+        0.0,
+        60.0,
+    ),
+
+    screenshot_seconds=_load_float_setting(
+        "CaptureScreenshotSeconds",
+        1.0,
+        0.0,
+        60.0,
+    ),
+
+    still_start_delay_seconds=_load_float_setting(
+        "CaptureStillStartDelaySeconds",
+        3.0,
+        0.0,
+        60.0,
+    ),
+
+    still_sample_seconds=_load_float_setting(
+        "CaptureStillSampleSeconds",
+        2.0,
+        0.25,
+        60.0,
+    ),
+
+    still_sample_duration_seconds=_load_float_setting(
+        "CaptureStillSampleDurationSeconds",
+        30.0,
+        1.0,
+        300.0,
+    ),
+
+    qsv_preset=_load_string_setting(
+        "CaptureQsvPreset",
+        "veryfast",
+    ),
+
+    qsv_async_depth=_load_int_setting(
+        "CaptureQsvAsyncDepth",
+        2,
+        1,
+        16,
+    ),
+
+    displays=[
+        _load_capture_display(
+            "Playfield",
+            "0,0,1440,2560",
+            True,
+            24,
+            23,
+        ),
+
+        _load_capture_display(
+            "Backglass",
+            "1440,0,1280,1024",
+            True,
+            15,
+            25,
+        ),
+
+        _load_capture_display(
+            "Dmd",
+            "2720,0,1920,480",
+            False,
+            15,
+            25,
+        ),
+    ],
+
+    log=log,
+)
 
 
 def focus_emulationstation():
@@ -871,13 +1107,33 @@ def _handle_es_event(event: dict):
             or _viewer_state.system
         )
 
-        debug(f"[state] game-start system={system!r} event={event!r}")
+        browse_event = _viewer_state.browse_event or {}
+
+        path = (
+            (event.get("path") or "").strip().strip('"')
+            or (browse_event.get("path") or "").strip().strip('"')
+        )
+
+        debug(
+            f"[state] game-start "
+            f"system={system!r} "
+            f"path={path!r} "
+            f"event={event!r}"
+        )
 
         if system.lower() in BLANK_ON_GAME_START_SYSTEMS:
-            _blank_displays(f"game-start system={system}")
+            _blank_displays(
+                f"game-start system={system}"
+            )
+
+        CAPTURE_MANAGER.game_started(
+            system,
+            path,
+        )
         return
 
     if event_name == "game-end":
+        CAPTURE_MANAGER.game_ended()
         _viewer_state.mode = "browsing"
         if not _viewer_state.suspended:
             _restore_browse_state("game-end")
