@@ -64,10 +64,12 @@ For example:
 
 ```bat
 @echo off
-start "" /min py -3 "C:\RetroBat\plugins\RetroBatDisplayCompanion\display_companion.py"
+start "" /min py -3 "C:\RetroBat\plugins\retrobat-display-companion\display_companion.py"
 ```
 
-Display numbers, media modes, pipe names and other options can be configured near the top of `display_companion.py`.
+Media modes, DMD dimensions, capture regions, and other user-facing options are
+configured in `display_companion.ini`. Pipe names, display numbers, and advanced
+developer settings remain constants near the top of `display_companion.py`.
 
 ## Status
 

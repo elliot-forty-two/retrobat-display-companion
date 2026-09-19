@@ -259,7 +259,7 @@ class CaptureManager:
         }
 
         self.output_dir = Path(output_dir)
-        self.ffmpeg = self._resolve_ffmpeg(ffmpeg)
+        self.ffmpeg = self._resolve_ffmpeg(ffmpeg) if enabled else ""
 
         self.duration_seconds = duration_seconds
         self.displays = displays
@@ -306,10 +306,11 @@ class CaptureManager:
                 "Capture enabled but no playfield display configured"
             )
 
-        self.output_dir.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
+        if self.enabled:
+            self.output_dir.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
 
     # ------------------------------------------------------------------
     # Public API
@@ -640,7 +641,7 @@ class CaptureManager:
         stop_event: threading.Event,
     ):
         stamp = datetime.now().strftime(
-            "%Y%m%d-%H%M%S"
+            "%Y%m%d-%H%M%S-%f"
         )
 
         run_dir = (
@@ -757,6 +758,11 @@ class CaptureManager:
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait()
+
+        except Exception:
+            for capture in video_captures:
+                self._stop_ffmpeg(capture.process)
+            raise
 
         finally:
             with self._lock:

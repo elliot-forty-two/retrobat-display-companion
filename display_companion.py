@@ -68,16 +68,28 @@ MPV_INSTANCES = [
 class ViewerShutdown(Exception):
     pass
 
-def _load_viewer_setting(name: str, default: str, allowed: tuple[str, ...]) -> str:
-    value = default
+
+def _read_viewer_config() -> configparser.ConfigParser:
     config = configparser.ConfigParser()
     if VIEWER_CONFIG_FILE.exists():
         try:
             config.read(VIEWER_CONFIG_FILE, encoding="utf-8")
-            section = config["DisplayCompanion"] if "DisplayCompanion" in config else {}
-            value = str(section.get(name, default)).strip().lower()
-        except Exception:
-            value = default
+        except (OSError, configparser.Error):
+            pass
+    return config
+
+
+_VIEWER_CONFIG = _read_viewer_config()
+
+
+def _viewer_config_value(name: str, default):
+    if "DisplayCompanion" not in _VIEWER_CONFIG:
+        return default
+    return _VIEWER_CONFIG["DisplayCompanion"].get(name, default)
+
+
+def _load_viewer_setting(name: str, default: str, allowed: tuple[str, ...]) -> str:
+    value = str(_viewer_config_value(name, default)).strip().lower()
 
     if value not in allowed:
         return default
@@ -85,42 +97,22 @@ def _load_viewer_setting(name: str, default: str, allowed: tuple[str, ...]) -> s
 
 
 def _load_int_setting(name: str, default: int, min_value: int, max_value: int) -> int:
-    value = default
-    config = configparser.ConfigParser()
-    if VIEWER_CONFIG_FILE.exists():
-        try:
-            config.read(VIEWER_CONFIG_FILE, encoding="utf-8")
-            section = config["DisplayCompanion"] if "DisplayCompanion" in config else {}
-            raw = section.get(name, default)
-            value = int(str(raw).strip())
-        except Exception:
-            value = default
+    try:
+        value = int(str(_viewer_config_value(name, default)).strip())
+    except (TypeError, ValueError):
+        value = default
     return max(min_value, min(max_value, value))
 
 
 def _load_float_setting(name: str, default: float, min_value: float, max_value: float) -> float:
-    value = default
-    config = configparser.ConfigParser()
-    if VIEWER_CONFIG_FILE.exists():
-        try:
-            config.read(VIEWER_CONFIG_FILE, encoding="utf-8")
-            section = config["DisplayCompanion"] if "DisplayCompanion" in config else {}
-            raw = section.get(name, default)
-            value = float(str(raw).strip())
-        except Exception:
-            value = default
+    try:
+        value = float(str(_viewer_config_value(name, default)).strip())
+    except (TypeError, ValueError):
+        value = default
     return max(min_value, min(max_value, value))
 
 def _load_csv_setting(name: str, default: str) -> set[str]:
-    value = default
-    config = configparser.ConfigParser()
-    if VIEWER_CONFIG_FILE.exists():
-        try:
-            config.read(VIEWER_CONFIG_FILE, encoding="utf-8")
-            section = config["DisplayCompanion"] if "DisplayCompanion" in config else {}
-            value = str(section.get(name, default))
-        except Exception:
-            value = default
+    value = str(_viewer_config_value(name, default))
     return {
         item.strip().lower()
         for item in value.split(",")
@@ -128,35 +120,11 @@ def _load_csv_setting(name: str, default: str) -> set[str]:
     }
 
 def _load_bool_setting(name: str, default: bool) -> bool:
-    config = configparser.ConfigParser()
-
-    if VIEWER_CONFIG_FILE.exists():
-        try:
-            config.read(
-                VIEWER_CONFIG_FILE,
-                encoding="utf-8",
-            )
-
-            section = (
-                config["DisplayCompanion"]
-                if "DisplayCompanion" in config
-                else {}
-            )
-
-            raw = str(
-                section.get(name, str(default))
-            ).strip().lower()
-
-            return raw in (
-                "1",
-                "true",
-                "yes",
-                "on",
-            )
-
-        except Exception:
-            pass
-
+    raw = str(_viewer_config_value(name, str(default))).strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
     return default
 
 
@@ -164,29 +132,7 @@ def _load_string_setting(
     name: str,
     default: str,
 ) -> str:
-    config = configparser.ConfigParser()
-
-    if VIEWER_CONFIG_FILE.exists():
-        try:
-            config.read(
-                VIEWER_CONFIG_FILE,
-                encoding="utf-8",
-            )
-
-            section = (
-                config["DisplayCompanion"]
-                if "DisplayCompanion" in config
-                else {}
-            )
-
-            return str(
-                section.get(name, default)
-            ).strip()
-
-        except Exception:
-            pass
-
-    return default
+    return str(_viewer_config_value(name, default)).strip()
 
 
 def _load_capture_display(
@@ -196,20 +142,18 @@ def _load_capture_display(
     fps_default: int,
     quality_default: int,
 ) -> CaptureDisplay:
+    default_parts = [int(part.strip()) for part in coords_default.split(",")]
     value = _load_string_setting(
         f"Capture{name}",
         coords_default,
     )
 
-    parts = [
-        int(part.strip())
-        for part in value.split(",")
-    ]
-
-    if len(parts) != 4:
-        raise ValueError(
-            f"Capture{name} must be x,y,width,height"
-        )
+    try:
+        parts = [int(part.strip()) for part in value.split(",")]
+        if len(parts) != 4 or parts[2] <= 0 or parts[3] <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        parts = default_parts
 
     return CaptureDisplay(
         name=name.lower(),
@@ -515,13 +459,13 @@ def start_mpv_instances():
 
 def send_mpv(cmd_obj: dict, pipe_name: str = BACKGLASS_PIPE_NAME, timeout_s: float = 1.5, event_id: str = "") -> bool:
     start_ms = _now_ms()
-    deadline = time.time() + timeout_s
+    deadline = time.monotonic() + timeout_s
     last_err = None
     attempts = 0
     payload = json.dumps(cmd_obj)
     cmd = cmd_obj.get("command", ["?"])[0] if isinstance(cmd_obj, dict) else "?"
 
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         attempts += 1
         try:
             with open(pipe_name, "r+", encoding="utf-8") as pipe:
@@ -536,6 +480,9 @@ def send_mpv(cmd_obj: dict, pipe_name: str = BACKGLASS_PIPE_NAME, timeout_s: flo
             time.sleep(0.02)
 
     elapsed = _elapsed_ms(start_ms)
+    _last_loaded_by_pipe.pop(pipe_name, None)
+    _last_keepaspect_by_pipe.pop(pipe_name, None)
+    _fullscreen_set_by_pipe.pop(pipe_name, None)
     log(f"{event_id} ERROR: could not connect to mpv IPC pipe {pipe_name}: {last_err}; elapsed={elapsed:.1f}ms attempts={attempts} cmd={cmd!r}")
     return False
 
@@ -551,9 +498,23 @@ def show_in_mpv(path: str, pipe_name: str = BACKGLASS_PIPE_NAME, event_id: str =
 
     is_video = Path(path).suffix.lower() in VIDEO_EXTS
     last_path = _last_loaded_by_pipe.get(pipe_name)
-    if last_path == path:
+    if last_path == path and mpv_pipe_available(pipe_name):
         debug(f"{event_id} show_in_mpv skip unchanged pipe={pipe_name} path={path}")
         return
+
+    if not mpv_pipe_available(pipe_name):
+        _last_loaded_by_pipe.pop(pipe_name, None)
+        _last_keepaspect_by_pipe.pop(pipe_name, None)
+        _fullscreen_set_by_pipe.pop(pipe_name, None)
+        config = next((item for item in MPV_INSTANCES if item["pipe"] == pipe_name), None)
+        if config is None:
+            log(f"{event_id} ERROR: no MPV configuration for pipe {pipe_name}")
+            return
+        try:
+            ensure_mpv_running(config["pipe"], config["screen"], config["title"])
+        except Exception as e:
+            log(f"{event_id} ERROR: unable to restart MPV for {pipe_name}: {type(e).__name__}: {e}")
+            return
 
     debug(f"{event_id} show_in_mpv start pipe={pipe_name} video={is_video} path={path}")
     keepaspect = not is_video
@@ -812,6 +773,12 @@ def show_selected_media(fanart: Path | None, marquee: Path | None, backglass: Pa
     def alive() -> bool:
         return True if should_continue is None else bool(should_continue())
 
+    def display_if_current(action) -> bool:
+        with _display_io_lock:
+            if not alive():
+                return False
+            return bool(action())
+
     def show_smart_fanart(use_marquee: bool) -> bool:
         if not fanart or not os.path.isfile(fanart):
             return False
@@ -819,9 +786,15 @@ def show_selected_media(fanart: Path | None, marquee: Path | None, backglass: Pa
         try:
             cached = cached_composite_path(str(fanart), overlay)
             if cached.exists() and cached.stat().st_size > 0:
-                if alive():
+                if display_if_current(
+                    lambda: show_media_or_blank(
+                        cached,
+                        BACKGLASS_PIPE_NAME,
+                        event_id=event_id,
+                        blank_missing=True,
+                    )
+                ):
                     debug(f"{event_id} fanart composite cache_hit path={cached}")
-                    show_in_mpv(str(cached), pipe_name=BACKGLASS_PIPE_NAME, event_id=event_id)
                     return True
                 debug(f"{event_id} fanart composite cache_hit ignored; superseded")
                 return False
@@ -836,10 +809,16 @@ def show_selected_media(fanart: Path | None, marquee: Path | None, backglass: Pa
             shown = {"value": False}
 
             def guarded_show(out_path: str):
-                if not alive():
+                if not display_if_current(
+                    lambda: show_media_or_blank(
+                        Path(out_path),
+                        BACKGLASS_PIPE_NAME,
+                        event_id=event_id,
+                        blank_missing=True,
+                    )
+                ):
                     debug(f"{event_id} fanart composite render produced stale output; not displaying path={out_path}")
                     return
-                show_in_mpv(out_path, pipe_name=BACKGLASS_PIPE_NAME, event_id=event_id)
                 shown["value"] = True
 
             make_composite_and_show(str(fanart), overlay, guarded_show)
@@ -847,15 +826,24 @@ def show_selected_media(fanart: Path | None, marquee: Path | None, backglass: Pa
             return shown["value"]
         except Exception as e:
             log(f"{event_id} fanart composite failed: {type(e).__name__}: {e}")
-            if alive():
-                return show_media_or_blank(fanart, BACKGLASS_PIPE_NAME, event_id=event_id, blank_missing=True)
-            return False
+            return display_if_current(
+                lambda: show_media_or_blank(
+                    fanart,
+                    BACKGLASS_PIPE_NAME,
+                    event_id=event_id,
+                    blank_missing=True,
+                )
+            )
 
     dmd_media = dmd_video or (logo if DMD_SCREEN_MODE == "logo" else marquee) or (marquee if DMD_SCREEN_MODE == "logo" else logo)
-    dmd_handled = False
-    if alive():
-        dmd_handled = show_dmd_media_or_blank(dmd_media, event_id=event_id, blank_missing=True)
-    else:
+    dmd_handled = display_if_current(
+        lambda: show_dmd_media_or_blank(
+            dmd_media,
+            event_id=event_id,
+            blank_missing=True,
+        )
+    )
+    if not alive():
         debug(f"{event_id} display abort before DMD; superseded")
         return False
 
@@ -869,17 +857,23 @@ def show_selected_media(fanart: Path | None, marquee: Path | None, backglass: Pa
         bg_handled = show_smart_fanart(use_marquee=False)
     elif BACKGLASS_SCREEN_MODE == "backglass":
         if backglass and os.path.isfile(backglass):
-            bg_handled = show_media_or_blank(backglass, BACKGLASS_PIPE_NAME, event_id=event_id, blank_missing=True)
+            bg_handled = display_if_current(
+                lambda: show_media_or_blank(backglass, BACKGLASS_PIPE_NAME, event_id=event_id, blank_missing=True)
+            )
         else:
             bg_handled = show_smart_fanart(use_marquee=False)
     else:
         if backglass and os.path.isfile(backglass):
-            bg_handled = show_media_or_blank(backglass, BACKGLASS_PIPE_NAME, event_id=event_id, blank_missing=True)
+            bg_handled = display_if_current(
+                lambda: show_media_or_blank(backglass, BACKGLASS_PIPE_NAME, event_id=event_id, blank_missing=True)
+            )
         else:
             bg_handled = show_smart_fanart(use_marquee=True)
 
     if not bg_handled and alive():
-        blank_mpv(BACKGLASS_PIPE_NAME, event_id=event_id)
+        display_if_current(
+            lambda: (blank_mpv(BACKGLASS_PIPE_NAME, event_id=event_id) or True)
+        )
 
     handled = dmd_handled or bg_handled
     debug(f"{event_id} show_selected_media done handled={handled} dmd={dmd_handled} backglass={bg_handled} elapsed={_elapsed_ms(start_ms):.1f}ms")
@@ -897,6 +891,7 @@ _viewer_state = ViewerState()
 
 # -------------------- Simple latest-only display handling --------------------
 _lock = threading.Lock()
+_display_io_lock = threading.RLock()
 _job_id = 0
 _last_loaded_by_pipe: dict[str, str] = {}
 _last_keepaspect_by_pipe: dict[str, bool] = {}
@@ -925,8 +920,9 @@ def _cancel_pending_display(reason: str = ""):
 def _blank_displays(reason: str):
     _cancel_pending_display(reason)
     debug(f"[state] blank displays reason={reason!r}")
-    blank_mpv(BACKGLASS_PIPE_NAME, event_id="[state]")
-    blank_mpv(DMD_PIPE_NAME, event_id="[state]")
+    with _display_io_lock:
+        blank_mpv(BACKGLASS_PIPE_NAME, event_id="[state]")
+        blank_mpv(DMD_PIPE_NAME, event_id="[state]")
 
 def _restore_browse_state(reason: str):
     event = _viewer_state.browse_event
@@ -1035,8 +1031,10 @@ def _process_message_for_display(msg: dict, job_id: int):
             )
 
             if not handled and not is_job_stale(job_id):
-                show_in_mpv(str(FALLBACK_IMAGE), pipe_name=BACKGLASS_PIPE_NAME, event_id=event_id)
-                show_in_mpv(str(FALLBACK_IMAGE), pipe_name=DMD_PIPE_NAME, event_id=event_id)
+                with _display_io_lock:
+                    if not is_job_stale(job_id):
+                        show_in_mpv(str(FALLBACK_IMAGE), pipe_name=BACKGLASS_PIPE_NAME, event_id=event_id)
+                        show_in_mpv(str(FALLBACK_IMAGE), pipe_name=DMD_PIPE_NAME, event_id=event_id)
 
             debug(f"{event_id} worker display done system handled={handled} elapsed={_elapsed_ms(start_ms):.1f}ms")
 
@@ -1187,9 +1185,12 @@ def _event_pipe_listener():
 
 def _shutdown_viewer(reason: str):
     log(f"[quit] {reason}; stopping server")
+    _cancel_pending_display(reason)
+    CAPTURE_MANAGER.game_ended()
     try:
-        send_mpv({"command": ["quit"]}, pipe_name=BACKGLASS_PIPE_NAME, event_id="[quit]")
-        send_mpv({"command": ["quit"]}, pipe_name=DMD_PIPE_NAME, event_id="[quit]")
+        with _display_io_lock:
+            send_mpv({"command": ["quit"]}, pipe_name=BACKGLASS_PIPE_NAME, event_id="[quit]")
+            send_mpv({"command": ["quit"]}, pipe_name=DMD_PIPE_NAME, event_id="[quit]")
     except Exception as e:
         log(f"[quit] mpv quit failed: {type(e).__name__}: {e}")
 
@@ -1218,3 +1219,4 @@ if __name__ == "__main__":
         serve()
     except Exception as e:
         log(f"FATAL ERROR: {type(e).__name__}: {e}")
+        raise

@@ -1,5 +1,6 @@
 import os
 import hashlib
+import time
 from pathlib import Path
 from collections import OrderedDict
 from typing import Callable
@@ -31,6 +32,42 @@ SAL_CROP_CACHE = OrderedDict()
 SAL_CROP_CACHE_MAX = 250
 AVOID_CACHE = OrderedDict()
 AVOID_CACHE_MAX = 250
+
+CACHE_MAX_BYTES = 1024 * 1024 * 1024
+CACHE_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
+
+
+def cleanup_disk_cache() -> None:
+    """Remove expired cache files, then trim oldest files to the size limit."""
+    now = time.time()
+    entries = []
+    total_size = 0
+
+    for path in CACHE_DIR.glob("*.png"):
+        try:
+            stat = path.stat()
+            if now - stat.st_mtime > CACHE_MAX_AGE_SECONDS:
+                path.unlink()
+                continue
+            entries.append((stat.st_mtime, stat.st_size, path))
+            total_size += stat.st_size
+        except OSError:
+            continue
+
+    if total_size <= CACHE_MAX_BYTES:
+        return
+
+    for _, size, path in sorted(entries):
+        try:
+            path.unlink()
+            total_size -= size
+        except OSError:
+            continue
+        if total_size <= CACHE_MAX_BYTES:
+            break
+
+
+cleanup_disk_cache()
 
 
 def lru_get(cache: OrderedDict, key: str):
@@ -386,7 +423,8 @@ def make_composite_and_show(
         show_func(str(out_cache))
         return
 
-    fan = Image.open(fanart_path)
+    with Image.open(fanart_path) as fan_source:
+        fan = fan_source.convert("RGBA")
 
     sal_key = make_cache_key("sal", CROP_VERSION, fanart_path, file_sig(fanart_path))
     sal_payload = saliency_integral_cached(sal_key, fan)
@@ -399,7 +437,8 @@ def make_composite_and_show(
     canvas.paste(fan_final.convert("RGB"), (0, 0))
 
     if marquee_path and os.path.isfile(marquee_path):
-        mar = trim_transparent(Image.open(marquee_path).convert("RGBA"))
+        with Image.open(marquee_path) as marquee_source:
+            mar = trim_transparent(marquee_source.convert("RGBA"))
         avoid_key = make_cache_key(
             "avoid",
             PLACE_VERSION,
