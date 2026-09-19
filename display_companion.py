@@ -48,6 +48,8 @@ MPV_COMMON_ARGS = [
     "--keep-open=yes",
     "--image-display-duration=inf",
     "--force-window=yes",
+    "--background=none",
+    "--d3d11-flip=no",
 ]
 
 MPV_INSTANCES = [
@@ -95,6 +97,16 @@ def _load_viewer_setting(name: str, default: str, allowed: tuple[str, ...]) -> s
         return default
     return value
 
+
+def _load_media_type_list(name: str, default: tuple[str, ...], allowed: tuple[str, ...]) -> tuple[str, ...]:
+    """Load an ordered, de-duplicated list of display media types."""
+    value = str(_viewer_config_value(name, ",".join(default)))
+    media_types = []
+    for item in value.split(","):
+        item = item.strip().lower()
+        if item in allowed and item not in media_types:
+            media_types.append(item)
+    return tuple(media_types) or default
 
 def _load_int_setting(name: str, default: int, min_value: int, max_value: int) -> int:
     try:
@@ -185,16 +197,16 @@ def _load_capture_display(
     )
 
 
-BACKGLASS_SCREEN_MODE = _load_viewer_setting(
-    "BackglassScreenMode",
-    "auto",
-    ("auto", "fanart", "backglass"),
+BACKGLASS_MEDIA_TYPES = _load_media_type_list(
+    "BackglassMediaTypes",
+    ("video", "backglass", "composite", "fanart"),
+    ("video", "backglass", "composite", "fanart"),
 )
 
-DMD_SCREEN_MODE = _load_viewer_setting(
-    "DmdScreenMode",
-    "logo",
-    ("logo", "marquee"),
+DMD_MEDIA_TYPES = _load_media_type_list(
+    "DmdMediaTypes",
+    ("video", "logo", "marquee"),
+    ("video", "logo", "marquee"),
 )
 
 DMD_TARGET_W = _load_int_setting("DmdWidth", 1920, 320, 8192)
@@ -524,6 +536,8 @@ def show_in_mpv(path: str, pipe_name: str = BACKGLASS_PIPE_NAME, event_id: str =
     else:
         debug(f"{event_id} mpv keepaspect skip unchanged pipe={pipe_name} value={keepaspect}")
 
+    loop_file = "inf" if is_video and pipe_name == BACKGLASS_PIPE_NAME else "no"
+    send_mpv({"command": ["set_property", "loop-file", loop_file]}, pipe_name=pipe_name, event_id=event_id)
     ok = send_mpv({"command": ["loadfile", path, "replace"]}, pipe_name=pipe_name, event_id=event_id)
     if ok:
         _last_loaded_by_pipe[pipe_name] = path
@@ -612,8 +626,8 @@ def centered_dmd_asset_path(src_path: Path, event_id: str = "") -> Path | None:
         return None
 
 
-def show_dmd_media_or_blank(path: Path | None, event_id: str = "", blank_missing: bool = True) -> bool:
-    if DMD_SCREEN_MODE == "logo" and path and os.path.isfile(path) and not is_video_path(path):
+def show_dmd_media_or_blank(path: Path | None, center_asset: bool = False, event_id: str = "", blank_missing: bool = True) -> bool:
+    if center_asset and path and os.path.isfile(path) and not is_video_path(path):
         centered = centered_dmd_asset_path(path, event_id=event_id)
         if centered and centered.exists() and centered.stat().st_size > 0:
             show_in_mpv(str(centered), pipe_name=DMD_PIPE_NAME, event_id=event_id)
@@ -716,7 +730,7 @@ def find_system_media(system: str, event_id: str = ""):
         f"logo={_short_path(logo)}"
     )
 
-    return fanart, marquee, backglass, logo, None
+    return fanart, marquee, backglass, logo, None, None
 
 
 def find_media_files(system: str, rom_path: Path, event_id: str = ""):
@@ -724,49 +738,34 @@ def find_media_files(system: str, rom_path: Path, event_id: str = ""):
     rom_name = rom_path.stem
     system = (system or "").strip().strip('"')
     images_dir = RETROBAT_ROOT / "roms" / system / "images"
-    backglass_video_dirs = [
-        RETROBAT_ROOT / "roms" / system / "video" / "Backglass",
-        RETROBAT_ROOT / "roms" / system / "videos" / "Backglass",
+    video_dirs = [
+        RETROBAT_ROOT / "roms" / system / "video",
+        RETROBAT_ROOT / "roms" / system / "videos",
     ]
-    dmd_video_dirs = [
-        RETROBAT_ROOT / "roms" / system / "video" / "DMD",
-        RETROBAT_ROOT / "roms" / system / "videos" / "DMD",
-    ]
-
     fanart = find_media_file(images_dir, rom_name, "fanart")
     marquee = find_media_file(images_dir, rom_name, "marquee", exts=IMAGE_EXTS)
     backglass = find_media_file(images_dir, rom_name, "backglass", exts=IMAGE_EXTS)
     logo = find_media_file_any(images_dir, rom_name, ("logo", "marquee-topper", "topper"), exts=IMAGE_EXTS)
 
     backglass_video = None
-    for media_dir in backglass_video_dirs:
-        backglass_video = find_media_file_stem(media_dir, rom_name, VIDEO_EXTS)
-        if backglass_video:
-            break
-
     dmd_video = None
-    for media_dir in dmd_video_dirs:
-        dmd_video = find_media_file_stem(media_dir, rom_name, VIDEO_EXTS)
-        if dmd_video:
+    for media_dir in video_dirs:
+        if not backglass_video:
+            backglass_video = find_media_file(media_dir, rom_name, "backglass", exts=VIDEO_EXTS)
+        if not dmd_video:
+            dmd_video = find_media_file(media_dir, rom_name, "dmd", exts=VIDEO_EXTS)
+        if backglass_video and dmd_video:
             break
-
-    if backglass_video:
-        backglass = backglass_video
-
     elapsed = _elapsed_ms(start_ms)
-    debug(f"{event_id} media_lookup elapsed={elapsed:.1f}ms system={system!r} rom={rom_name!r} fanart={_short_path(fanart)} marquee={_short_path(marquee)} backglass={_short_path(backglass)} logo={_short_path(logo)} dmd_video={_short_path(dmd_video)}")
-    return fanart, marquee, backglass, logo, dmd_video
+    debug(f"{event_id} media_lookup elapsed={elapsed:.1f}ms system={system!r} rom={rom_name!r} fanart={_short_path(fanart)} marquee={_short_path(marquee)} backglass={_short_path(backglass)} logo={_short_path(logo)} backglass_video={_short_path(backglass_video)} dmd_video={_short_path(dmd_video)}")
+    return fanart, marquee, backglass, logo, backglass_video, dmd_video
 
 
-def show_selected_media(fanart: Path | None, marquee: Path | None, backglass: Path | None, logo: Path | None, dmd_video: Path | None, event_id: str = "", should_continue=None) -> bool:
+def show_selected_media(fanart: Path | None, marquee: Path | None, backglass: Path | None, logo: Path | None, backglass_video: Path | None, dmd_video: Path | None, event_id: str = "", should_continue=None) -> bool:
     """Pick media and display it quickly.
 
-    Backglass handling is intentionally simple:
-    - real backglass media wins in auto/backglass mode
-    - otherwise fanart is shown through the compositor so it is smart-fit
-    - if a composite is cached, it is loaded immediately
-    - if not cached, it is rendered synchronously once, but the final mpv load is
-      guarded so an older job cannot overwrite a newer selection
+    Each display tries its configured media types in order. Backglass composite
+    media renders fanart with a marquee overlay; plain fanart is displayed directly.
     """
     start_ms = _now_ms()
 
@@ -835,14 +834,23 @@ def show_selected_media(fanart: Path | None, marquee: Path | None, backglass: Pa
                 )
             )
 
-    dmd_media = dmd_video or (logo if DMD_SCREEN_MODE == "logo" else marquee) or (marquee if DMD_SCREEN_MODE == "logo" else logo)
-    dmd_handled = display_if_current(
-        lambda: show_dmd_media_or_blank(
-            dmd_media,
-            event_id=event_id,
-            blank_missing=True,
+    dmd_handled = False
+    for media_type in DMD_MEDIA_TYPES:
+        path, center_asset = {
+            "video": (dmd_video, False),
+            "logo": (logo, True),
+            "marquee": (marquee, False),
+        }[media_type]
+        if path and os.path.isfile(path):
+            dmd_handled = display_if_current(
+                lambda: show_dmd_media_or_blank(path, center_asset, event_id=event_id, blank_missing=True)
+            )
+            if dmd_handled:
+                break
+    if not dmd_handled and alive():
+        dmd_handled = display_if_current(
+            lambda: show_dmd_media_or_blank(None, event_id=event_id, blank_missing=True)
         )
-    )
     if not alive():
         debug(f"{event_id} display abort before DMD; superseded")
         return False
@@ -852,24 +860,17 @@ def show_selected_media(fanart: Path | None, marquee: Path | None, backglass: Pa
         return dmd_handled
 
     bg_handled = False
-
-    if BACKGLASS_SCREEN_MODE == "fanart":
-        bg_handled = show_smart_fanart(use_marquee=False)
-    elif BACKGLASS_SCREEN_MODE == "backglass":
-        if backglass and os.path.isfile(backglass):
-            bg_handled = display_if_current(
-                lambda: show_media_or_blank(backglass, BACKGLASS_PIPE_NAME, event_id=event_id, blank_missing=True)
-            )
-        else:
-            bg_handled = show_smart_fanart(use_marquee=False)
-    else:
-        if backglass and os.path.isfile(backglass):
-            bg_handled = display_if_current(
-                lambda: show_media_or_blank(backglass, BACKGLASS_PIPE_NAME, event_id=event_id, blank_missing=True)
-            )
-        else:
+    for media_type in BACKGLASS_MEDIA_TYPES:
+        if media_type == "composite":
             bg_handled = show_smart_fanart(use_marquee=True)
-
+        else:
+            path = backglass_video if media_type == "video" else fanart if media_type == "fanart" else backglass
+            if path and os.path.isfile(path):
+                bg_handled = display_if_current(
+                    lambda: show_media_or_blank(path, BACKGLASS_PIPE_NAME, event_id=event_id, blank_missing=True)
+                )
+        if bg_handled:
+            break
     if not bg_handled and alive():
         display_if_current(
             lambda: (blank_mpv(BACKGLASS_PIPE_NAME, event_id=event_id) or True)
@@ -1015,7 +1016,7 @@ def _process_message_for_display(msg: dict, job_id: int):
                 debug(f"{event_id} worker skipped system-selected without system")
                 return
 
-            fanart, marquee, backglass, logo, dmd_video = find_system_media(
+            fanart, marquee, backglass, logo, backglass_video, dmd_video = find_system_media(
                 system,
                 event_id=event_id,
             )
@@ -1025,7 +1026,7 @@ def _process_message_for_display(msg: dict, job_id: int):
                 return
 
             handled = show_selected_media(
-                fanart, marquee, backglass, logo, dmd_video,
+                fanart, marquee, backglass, logo, backglass_video, dmd_video,
                 event_id=event_id,
                 should_continue=lambda: not is_job_stale(job_id),
             )
@@ -1045,14 +1046,14 @@ def _process_message_for_display(msg: dict, job_id: int):
             return
 
         rom_path = normalize_rom_path(path)
-        fanart, marquee, backglass, logo, dmd_video = find_media_files(system, rom_path, event_id=event_id)
+        fanart, marquee, backglass, logo, backglass_video, dmd_video = find_media_files(system, rom_path, event_id=event_id)
 
         if is_job_stale(job_id):
             debug(f"{event_id} worker abort after media_lookup; superseded")
             return
 
         handled = show_selected_media(
-            fanart, marquee, backglass, logo, dmd_video,
+            fanart, marquee, backglass, logo, backglass_video, dmd_video,
             event_id=event_id,
             should_continue=lambda: not is_job_stale(job_id),
         )
@@ -1201,8 +1202,8 @@ def serve():
     start_mpv_instances()
     
     log(
-        f"config BackglassScreenMode={BACKGLASS_SCREEN_MODE} "
-        f"DmdScreenMode={DMD_SCREEN_MODE} SimpleFastMode=True Compositing=True "
+        f"config BackglassMediaTypes={BACKGLASS_MEDIA_TYPES} "
+        f"DmdMediaTypes={DMD_MEDIA_TYPES} SimpleFastMode=True Compositing=True "
         f"InputMode=named-pipe EventPipe={ES_EVENT_PIPE_NAME} "
         f"SystemMediaDir={SYSTEM_MEDIA_DIR} "
         f"BlankOnGameStartSystems={sorted(BLANK_ON_GAME_START_SYSTEMS)} "
