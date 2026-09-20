@@ -121,7 +121,6 @@ class StillCandidate:
 class VideoCapture:
     display: CaptureDisplay
     process: subprocess.Popen
-    log_file: object
     output_path: Path
 
 
@@ -768,11 +767,6 @@ class CaptureManager:
             with self._lock:
                 self._capture_processes = []
 
-            for capture in video_captures:
-                try:
-                    capture.log_file.close()
-                except Exception:
-                    pass
 
         #
         # Allow PNG selector threads to finish.
@@ -853,10 +847,6 @@ class CaptureManager:
             display,
         )
 
-        log_path = (
-            run_dir
-            / f"{table_name}-{display.name}.log"
-        )
 
         args = [
             self.ffmpeg,
@@ -919,28 +909,16 @@ class CaptureManager:
             f"size={display.width}x{display.height}"
         )
 
-        log_file = open(
-            log_path,
-            "wb",
+        process = subprocess.Popen(
+            args,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=CREATE_NO_WINDOW,
         )
-
-        try:
-            process = subprocess.Popen(
-                args,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=log_file,
-                creationflags=CREATE_NO_WINDOW,
-            )
-
-        except Exception:
-            log_file.close()
-            raise
-
         return VideoCapture(
             display=display,
             process=process,
-            log_file=log_file,
             output_path=output_path,
         )
 
